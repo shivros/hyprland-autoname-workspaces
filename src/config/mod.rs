@@ -91,6 +91,8 @@ pub struct ConfigFormatRaw {
     pub client_dup_active: String,
     #[serde(default = "default_client_dup_fullscreen_formatter")]
     pub client_dup_fullscreen: String,
+    #[serde(default)]
+    pub exclude_special_workspaces: bool,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -266,6 +268,7 @@ version = "1.1.14"
 # window delimiter
 # delim = " "
 # max_clients = 30 # you should not need this
+# exclude_special_workspaces = false # exclude special workspaces (e.g. scratchpad)
 
 # available formatter:
 # {counter_sup} - superscripted count of clients on the workspace, and simple {counter}, {delim}
