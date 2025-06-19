@@ -6,20 +6,18 @@ jobs:
   clippy:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
-      - uses: actions-rs/toolchain@v1
+      - uses: dtolnay/rust-toolchain@stable
         name: Install Rust Toolchain
         with:
-          toolchain: stable
           components: clippy
-          override: true
 
       - uses: Swatinem/rust-cache@v2
         name: Add caching
 
-      - uses: actions-rs/clippy-check@v1
-        name: Lint and Check codebase with Clippy
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          args: --all-features --verbose
+      - name: Add problem matcher
+        run: echo "::add-matcher::${{ runner.tool_cache }}/rust.json"
+
+      - name: Lint and Check codebase with Clippy
+        run: cargo clippy --all-features --verbose -- -D warnings
