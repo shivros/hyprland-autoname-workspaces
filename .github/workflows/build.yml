@@ -16,17 +16,11 @@ jobs:
     steps:
       - uses: actions/checkout@v3
 
-      - uses: actions-rs/toolchain@v1
+      - uses: dtolnay/rust-toolchain@stable
         name: Install rust toolchain
-        with:
-          toolchain: stable
-          override: true
 
       - uses: Swatinem/rust-cache@v2
         name: Add caching
 
-      - uses: actions-rs/cargo@v1
-        name: Build crate
-        with:
-          command: build
-          args: --verbose --all-features
+      - name: Build crate
+        run: cargo build --verbose --all-features

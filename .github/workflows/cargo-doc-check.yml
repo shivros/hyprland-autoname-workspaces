@@ -16,17 +16,11 @@ jobs:
     steps:
       - uses: actions/checkout@v3
 
-      - uses: actions-rs/toolchain@v1
+      - uses: dtolnay/rust-toolchain@stable
         name: Install rust toolchain
-        with:
-          toolchain: stable
-          override: true
 
       - uses: Swatinem/rust-cache@v2
         name: Add caching
 
-      - uses: actions-rs/cargo@v1
-        name: Check Documentation with Rustdoc
-        with:
-          command: doc
-          args: --verbose --no-deps
+      - name: Check Documentation with Rustdoc
+        run: cargo doc --verbose --no-deps
