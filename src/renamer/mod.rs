@@ -7,11 +7,11 @@ mod macros;
 use crate::config::{Config, ConfigFile, ConfigFormatRaw};
 use crate::params::Args;
 use formatter::*;
-use hyprland::data::{Client, Clients, FullscreenMode, Workspace};
+use hyprland::data::{Client, Clients, FullscreenMode, Workspace, WorkspaceBasic};
 use hyprland::dispatch::*;
 use hyprland::event_listener::{EventListener, WorkspaceEventData};
 use hyprland::prelude::*;
-use hyprland::shared::Address;
+use hyprland::shared::{Address, WorkspaceType};
 use icon::{IconConfig, IconStatus};
 use inotify::{Inotify, WatchMask};
 use std::collections::{HashMap, HashSet};
@@ -20,10 +20,10 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 pub struct Renamer {
-    known_workspaces: Mutex<HashSet<i32>>,
+    known_workspaces: Mutex<HashSet<WorkspaceType>>,
     cfg: Mutex<Config>,
     args: Args,
-    workspace_strings_cache: Mutex<HashMap<i32, String>>,
+    workspace_strings_cache: Mutex<HashMap<WorkspaceType, String>>,
 }
 
 #[derive(Clone, Eq, Debug)]
@@ -70,6 +70,48 @@ impl AppClient {
     }
 }
 
+type ClientPosition = (i16, i16);
+type WorkspaceClients = HashMap<WorkspaceType, Vec<(AppClient, ClientPosition)>>;
+
+fn workspace_name_to_type(name: &str) -> WorkspaceType {
+    if let Some(name) = name.strip_prefix("special:") {
+        WorkspaceType::Special(Some(name.to_string()))
+    } else if name == "special" {
+        WorkspaceType::Special(None)
+    } else {
+        WorkspaceType::Regular(name.to_string())
+    }
+}
+
+trait WorkspaceTypeExt {
+    fn to_workspace_type(&self) -> WorkspaceType;
+}
+
+impl WorkspaceTypeExt for WorkspaceBasic {
+    fn to_workspace_type(&self) -> WorkspaceType {
+        WorkspaceType::try_from(self.id).unwrap_or_else(|_| workspace_name_to_type(&self.name))
+    }
+}
+
+impl WorkspaceTypeExt for Workspace {
+    fn to_workspace_type(&self) -> WorkspaceType {
+        WorkspaceType::try_from(self.id).unwrap_or_else(|_| workspace_name_to_type(&self.name))
+    }
+}
+
+fn workspace_id_strings(workspace: &WorkspaceType) -> (String, String) {
+    match workspace {
+        WorkspaceType::Regular(id) => match id.parse::<i32>() {
+            Ok(num) => (num.to_string(), format!("{num:02}")),
+            Err(_) => (id.clone(), id.clone()),
+        },
+        WorkspaceType::Special(_) => {
+            let identifier = workspace.to_string();
+            (identifier.clone(), identifier)
+        }
+    }
+}
+
 impl Renamer {
     pub fn new(cfg: Config, args: Args) -> Arc<Self> {
         Arc::new(Renamer {
@@ -95,7 +137,7 @@ impl Renamer {
 
         // Get workspaces based on open clients
         let workspaces = self.get_workspaces_from_clients(clients, active_client, config)?;
-        let workspace_ids: HashSet<_> = workspaces.iter().map(|w| w.id).collect();
+        let workspace_ids: HashSet<_> = workspaces.iter().map(|w| w.id.clone()).collect();
 
         // Generate workspace strings
         let workspaces_strings = self.generate_workspaces_string(workspaces, config);
@@ -103,8 +145,8 @@ impl Renamer {
         // Filter out unchanged workspaces
         let altered_workspaces = self.get_altered_workspaces(&workspaces_strings)?;
 
-        altered_workspaces.iter().for_each(|(&id, clients)| {
-            rename_cmd(id, clients, &config.format, &config.workspaces_name);
+        altered_workspaces.iter().for_each(|(id, clients)| {
+            rename_cmd(id.clone(), clients, &config.format, &config.workspaces_name);
         });
 
         self.update_cache(&altered_workspaces, &workspace_ids)?;
@@ -114,14 +156,14 @@ impl Renamer {
 
     fn get_altered_workspaces(
         &self,
-        workspaces_strings: &HashMap<i32, String>,
-    ) -> Result<HashMap<i32, String>, Box<dyn Error + '_>> {
+        workspaces_strings: &HashMap<WorkspaceType, String>,
+    ) -> Result<HashMap<WorkspaceType, String>, Box<dyn Error + '_>> {
         let cache = self.workspace_strings_cache.lock()?;
         Ok(workspaces_strings
             .iter()
-            .filter_map(|(&id, new_string)| {
-                if cache.get(&id) != Some(new_string) {
-                    Some((id, new_string.clone()))
+            .filter_map(|(id, new_string)| {
+                if cache.get(id) != Some(new_string) {
+                    Some((id.clone(), new_string.clone()))
                 } else {
                     None
                 }
@@ -131,16 +173,16 @@ impl Renamer {
 
     fn update_cache(
         &self,
-        workspaces_strings: &HashMap<i32, String>,
-        workspace_ids: &HashSet<i32>,
+        workspaces_strings: &HashMap<WorkspaceType, String>,
+        workspace_ids: &HashSet<WorkspaceType>,
     ) -> Result<(), Box<dyn Error + '_>> {
         let mut cache = self.workspace_strings_cache.lock()?;
-        for (&id, new_string) in workspaces_strings {
-            cache.insert(id, new_string.clone());
+        for (id, new_string) in workspaces_strings {
+            cache.insert(id.clone(), new_string.clone());
         }
 
         // Remove cached entries for workspaces that no longer exist
-        cache.retain(|&id, _| workspace_ids.contains(&id));
+        cache.retain(|id, _| workspace_ids.contains(id));
 
         Ok(())
     }
@@ -151,38 +193,35 @@ impl Renamer {
         active_client: String,
         config: &ConfigFile,
     ) -> Result<Vec<AppWorkspace>, Box<dyn Error + '_>> {
-        let mut workspaces: HashMap<i32, Vec<(AppClient, (i16, i16))>> = self
+        let mut workspaces: WorkspaceClients = self
             .known_workspaces
             .lock()?
             .iter()
-            .map(|&i| (i, Vec::new()))
+            .map(|i| (i.clone(), Vec::new()))
             .collect();
 
         let is_dedup_inactive_fullscreen = config.format.dedup_inactive_fullscreen;
 
         for client in clients {
-            let workspace_id = client.workspace.id;
-            self.known_workspaces.lock()?.insert(workspace_id);
+            let workspace_id = client.workspace.to_workspace_type();
+            self.known_workspaces.lock()?.insert(workspace_id.clone());
             let is_active = active_client == client.address.to_string();
-            workspaces
-                .entry(workspace_id)
-                .or_insert_with(Vec::new)
-                .push((
-                    AppClient::new(
-                        client.clone(),
+            workspaces.entry(workspace_id).or_default().push((
+                AppClient::new(
+                    client.clone(),
+                    is_active,
+                    is_dedup_inactive_fullscreen,
+                    self.parse_icon(
+                        client.initial_class,
+                        client.class,
+                        client.initial_title,
+                        client.title,
                         is_active,
-                        is_dedup_inactive_fullscreen,
-                        self.parse_icon(
-                            client.initial_class,
-                            client.class,
-                            client.initial_title,
-                            client.title,
-                            is_active,
-                            config,
-                        ),
+                        config,
                     ),
-                    client.at,
-                ));
+                ),
+                client.at,
+            ));
         }
 
         Ok(workspaces
@@ -203,7 +242,7 @@ impl Renamer {
         self.known_workspaces
             .lock()?
             .iter()
-            .for_each(|&id| rename_cmd(id, "", &config.format, &config.workspaces_name));
+            .for_each(|id| rename_cmd(id.clone(), "", &config.format, &config.workspaces_name));
 
         Ok(())
     }
@@ -267,52 +306,59 @@ impl Renamer {
     }
 
     fn remove_workspace(&self, wt: WorkspaceEventData) -> Result<bool, Box<dyn Error + '_>> {
-        Ok(self.known_workspaces.lock()?.remove(&wt.id))
+        Ok(self.known_workspaces.lock()?.remove(&wt.name))
     }
 }
 
 fn rename_empty_workspace(config: &ConfigFile) {
     _ = Workspace::get_active().map(|workspace| {
         if workspace.windows == 0 {
-            rename_cmd(workspace.id, "", &config.format, &config.workspaces_name);
+            rename_cmd(
+                workspace.to_workspace_type(),
+                "",
+                &config.format,
+                &config.workspaces_name,
+            );
         }
     });
 }
 
 fn rename_cmd(
-    id: i32,
+    workspace: WorkspaceType,
     clients: &str,
     config_format: &ConfigFormatRaw,
     workspaces_name: &[(String, String)],
 ) {
     let workspace_fmt = &config_format.workspace.to_string();
     let workspace_empty_fmt = &config_format.workspace_empty.to_string();
-    let id_two_digits = format!("{:02}", id);
-    let workspace_name = get_workspace_name(id, workspaces_name);
+    let (id, id_two_digits) = workspace_id_strings(&workspace);
+    let workspace_name = get_workspace_name(&workspace, workspaces_name);
 
     let mut vars = HashMap::from([
-        ("id".to_string(), id.to_string()),
+        ("id".to_string(), id),
         ("id_long".to_string(), id_two_digits),
         ("name".to_string(), workspace_name),
         ("delim".to_string(), config_format.delim.to_string()),
     ]);
 
     vars.insert("clients".to_string(), clients.to_string());
-    let workspace = if !clients.is_empty() {
+    let workspace_str = if !clients.is_empty() {
         formatter(workspace_fmt, &vars)
     } else {
         formatter(workspace_empty_fmt, &vars)
     };
 
-    let _ = hyprland::dispatch!(RenameWorkspace, id, Some(workspace.trim()));
+    let rename_args = format!("{} {}", workspace, workspace_str.trim());
+    let _ = hyprland::dispatch!(Custom, "renameworkspace", rename_args.as_str());
 }
 
-fn get_workspace_name(id: i32, workspaces_name: &[(String, String)]) -> String {
-    let default_workspace_name = id.to_string();
+fn get_workspace_name(workspace: &WorkspaceType, workspaces_name: &[(String, String)]) -> String {
+    let (id, _) = workspace_id_strings(workspace);
+    let default_workspace_name = id;
     workspaces_name
         .iter()
         .find_map(|(x, name)| {
-            if x.eq(&id.to_string()) {
+            if x.eq(&default_workspace_name) {
                 Some(name)
             } else {
                 None
@@ -352,6 +398,10 @@ mod tests {
     use super::*;
     use crate::renamer::IconConfig::*;
     use crate::renamer::IconStatus::*;
+
+    fn regular(id: i32) -> WorkspaceType {
+        WorkspaceType::try_from(id).unwrap()
+    }
 
     #[test]
     fn test_app_client_partial_eq() {
@@ -452,11 +502,11 @@ mod tests {
             },
         );
 
-        let expected = [(1, "term5".to_string())].into_iter().collect();
+        let expected = [(regular(1), "term5".to_string())].into_iter().collect();
 
         let actual = renamer.generate_workspaces_string(
             vec![AppWorkspace {
-                id: 1,
+                id: regular(1),
                 clients: vec![
                     AppClient {
                         initial_class: "kitty".to_string(),
@@ -588,11 +638,13 @@ mod tests {
             },
         );
 
-        let expected = [(1, "Zsh #Zsh# *Zsh*".to_string())].into_iter().collect();
+        let expected = [(regular(1), "Zsh #Zsh# *Zsh*".to_string())]
+            .into_iter()
+            .collect();
 
         let actual = renamer.generate_workspaces_string(
             vec![AppWorkspace {
-                id: 1,
+                id: regular(1),
                 clients: vec![
                     AppClient {
                         initial_class: "alacritty".to_string(),
@@ -680,11 +732,13 @@ mod tests {
             },
         );
 
-        let expected = [(1, "term2 term3".to_string())].into_iter().collect();
+        let expected = [(regular(1), "term2 term3".to_string())]
+            .into_iter()
+            .collect();
 
         let actual = renamer.generate_workspaces_string(
             vec![AppWorkspace {
-                id: 1,
+                id: regular(1),
                 clients: vec![
                     AppClient {
                         class: "kitty".to_string(),
@@ -808,13 +862,13 @@ mod tests {
             },
         );
 
-        let expected = [(1, "term term term term term".to_string())]
+        let expected = [(regular(1), "term term term term term".to_string())]
             .into_iter()
             .collect();
 
         let actual = renamer.generate_workspaces_string(
             vec![AppWorkspace {
-                id: 1,
+                id: regular(1),
                 clients: vec![
                     AppClient {
                         initial_class: "kitty".to_string(),
@@ -931,13 +985,13 @@ mod tests {
             },
         );
 
-        let expected = [(1, "term term *term* term term".to_string())]
+        let expected = [(regular(1), "term term *term* term term".to_string())]
             .into_iter()
             .collect();
 
         let actual = renamer.generate_workspaces_string(
             vec![AppWorkspace {
-                id: 1,
+                id: regular(1),
                 clients: vec![
                     AppClient {
                         initial_class: "kitty".to_string(),
@@ -1055,13 +1109,13 @@ mod tests {
             },
         );
 
-        let expected = [(1, "term term [term] term term".to_string())]
+        let expected = [(regular(1), "term term [term] term term".to_string())]
             .into_iter()
             .collect();
 
         let actual = renamer.generate_workspaces_string(
             vec![AppWorkspace {
-                id: 1,
+                id: regular(1),
                 clients: vec![
                     AppClient {
                         initial_class: "kitty".to_string(),
@@ -1179,13 +1233,13 @@ mod tests {
             },
         );
 
-        let expected = [(1, "term term [*term*] term term".to_string())]
+        let expected = [(regular(1), "term term [*term*] term term".to_string())]
             .into_iter()
             .collect();
 
         let actual = renamer.generate_workspaces_string(
             vec![AppWorkspace {
-                id: 1,
+                id: regular(1),
                 clients: vec![
                     AppClient {
                         class: "kitty".to_string(),
@@ -1303,11 +1357,11 @@ mod tests {
             },
         );
 
-        let expected = [(1, "term5".to_string())].into_iter().collect();
+        let expected = [(regular(1), "term5".to_string())].into_iter().collect();
 
         let actual = renamer.generate_workspaces_string(
             vec![AppWorkspace {
-                id: 1,
+                id: regular(1),
                 clients: vec![
                     AppClient {
                         initial_class: "kitty".to_string(),
@@ -1393,11 +1447,13 @@ mod tests {
             },
         );
 
-        let expected = [(1, "term4 *term*".to_string())].into_iter().collect();
+        let expected = [(regular(1), "term4 *term*".to_string())]
+            .into_iter()
+            .collect();
 
         let actual = renamer.generate_workspaces_string(
             vec![AppWorkspace {
-                id: 1,
+                id: regular(1),
                 clients: vec![
                     AppClient {
                         class: "kitty".to_string(),
@@ -1518,11 +1574,13 @@ mod tests {
             },
         );
 
-        let expected = [(1, "term4 [term]".to_string())].into_iter().collect();
+        let expected = [(regular(1), "term4 [term]".to_string())]
+            .into_iter()
+            .collect();
 
         let actual = renamer.generate_workspaces_string(
             vec![AppWorkspace {
-                id: 1,
+                id: regular(1),
                 clients: vec![
                     AppClient {
                         class: "kitty".to_string(),
@@ -1646,11 +1704,13 @@ mod tests {
             },
         );
 
-        let expected = [(1, "term4 [*term*]".to_string())].into_iter().collect();
+        let expected = [(regular(1), "term4 [*term*]".to_string())]
+            .into_iter()
+            .collect();
 
         let actual = renamer.generate_workspaces_string(
             vec![AppWorkspace {
-                id: 1,
+                id: regular(1),
                 clients: vec![
                     AppClient {
                         class: "kitty".to_string(),
@@ -1781,11 +1841,13 @@ mod tests {
             },
         );
 
-        let expected = [(1, "KKK *a* DDD".to_string())].into_iter().collect();
+        let expected = [(regular(1), "KKK *a* DDD".to_string())]
+            .into_iter()
+            .collect();
 
         let actual = renamer.generate_workspaces_string(
             vec![AppWorkspace {
-                id: 1,
+                id: regular(1),
                 clients: vec![
                     AppClient {
                         initial_class: "kitty".to_string(),
@@ -1868,11 +1930,11 @@ mod tests {
             },
         );
 
-        let expected = [(1, "spotify".to_string())].into_iter().collect();
+        let expected = [(regular(1), "spotify".to_string())].into_iter().collect();
 
         let actual = renamer.generate_workspaces_string(
             vec![AppWorkspace {
-                id: 1,
+                id: regular(1),
                 clients: vec![AppClient {
                     initial_class: "".to_string(),
                     class: "".to_string(),
@@ -1919,11 +1981,11 @@ mod tests {
             },
         );
 
-        let expected = [(1, "osu".to_string())].into_iter().collect();
+        let expected = [(regular(1), "osu".to_string())].into_iter().collect();
 
         let actual = renamer.generate_workspaces_string(
             vec![AppWorkspace {
-                id: 1,
+                id: regular(1),
                 clients: vec![AppClient {
                     initial_class: "osu!".to_string(),
                     class: "osu!".to_string(),
@@ -1979,13 +2041,16 @@ mod tests {
             },
         );
 
-        let expected = [(1, "*default inactive* default inactive".to_string())]
-            .into_iter()
-            .collect();
+        let expected = [(
+            regular(1),
+            "*default inactive* default inactive".to_string(),
+        )]
+        .into_iter()
+        .collect();
 
         let actual = renamer.generate_workspaces_string(
             vec![AppWorkspace {
-                id: 1,
+                id: regular(1),
                 clients: vec![
                     AppClient {
                         initial_class: "fake-app-unknown".to_string(),
@@ -2052,11 +2117,13 @@ mod tests {
             },
         );
 
-        let expected = [(1, "default active".to_string())].into_iter().collect();
+        let expected = [(regular(1), "default active".to_string())]
+            .into_iter()
+            .collect();
 
         let actual = renamer.generate_workspaces_string(
             vec![AppWorkspace {
-                id: 1,
+                id: regular(1),
                 clients: vec![AppClient {
                     initial_class: "kitty".to_string(),
                     class: "kitty".to_string(),
@@ -2099,7 +2166,7 @@ mod tests {
 
         let actual = renamer.generate_workspaces_string(
             vec![AppWorkspace {
-                id: 1,
+                id: regular(1),
                 clients: vec![AppClient {
                     initial_class: "kitty".to_string(),
                     class: "kitty".to_string(),
@@ -2123,7 +2190,9 @@ mod tests {
 
         // When no active default is configured, the inactive default is used
         // and run through the same formatter as a normal inactive client.
-        let expected = [(1, "*\u{f059} kitty*".to_string())].into_iter().collect();
+        let expected = [(regular(1), "*\u{f059} kitty*".to_string())]
+            .into_iter()
+            .collect();
 
         assert_eq!(actual, expected);
     }
@@ -2160,11 +2229,11 @@ mod tests {
             },
         );
 
-        let expected = [(1, "term2".to_string())].into_iter().collect();
+        let expected = [(regular(1), "term2".to_string())].into_iter().collect();
 
         let actual = renamer.generate_workspaces_string(
             vec![AppWorkspace {
-                id: 1,
+                id: regular(1),
                 clients: vec![AppClient {
                     initial_class: "kitty".to_string(),
                     class: "kitty".to_string(),
@@ -2209,7 +2278,7 @@ mod tests {
 
         let actual = renamer.generate_workspaces_string(
             vec![AppWorkspace {
-                id: 1,
+                id: regular(1),
                 clients: vec![AppClient {
                     initial_class: "kitty".to_string(),
                     class: "kitty".to_string(),
@@ -2231,7 +2300,7 @@ mod tests {
             &config,
         );
 
-        let expected = [(1, "term3".to_string())].into_iter().collect();
+        let expected = [(regular(1), "term3".to_string())].into_iter().collect();
 
         assert_eq!(actual, expected);
 
@@ -2256,7 +2325,7 @@ mod tests {
 
         let actual = renamer.generate_workspaces_string(
             vec![AppWorkspace {
-                id: 1,
+                id: regular(1),
                 clients: vec![AppClient {
                     initial_class: "kitty".to_string(),
                     class: "kitty".to_string(),
@@ -2278,7 +2347,7 @@ mod tests {
             &config,
         );
 
-        let expected = [(1, "term4".to_string())].into_iter().collect();
+        let expected = [(regular(1), "term4".to_string())].into_iter().collect();
 
         assert_eq!(actual, expected);
     }
@@ -2309,7 +2378,7 @@ mod tests {
 
         let mut app_workspaces = vec![
             AppWorkspace {
-                id: 1,
+                id: regular(1),
                 clients: vec![AppClient {
                     initial_class: "kitty".to_string(),
                     class: "kitty".to_string(),
@@ -2329,7 +2398,7 @@ mod tests {
                 }],
             },
             AppWorkspace {
-                id: 2,
+                id: regular(2),
                 clients: vec![AppClient {
                     initial_class: "kitty".to_string(),
                     class: "kitty".to_string(),
@@ -2355,7 +2424,7 @@ mod tests {
         let altered_strings = renamer.get_altered_workspaces(&strings).unwrap();
         assert_eq!(strings, altered_strings);
 
-        let workspace_ids: HashSet<_> = app_workspaces.iter().map(|w| w.id).collect();
+        let workspace_ids: HashSet<_> = app_workspaces.iter().map(|w| w.id.clone()).collect();
         renamer
             .update_cache(&altered_strings, &workspace_ids)
             .unwrap();
@@ -2363,8 +2432,8 @@ mod tests {
         {
             let cache = renamer.workspace_strings_cache.lock().unwrap();
             assert_eq!(cache.len(), app_workspaces.len());
-            assert_eq!(cache.get(&1), strings.get(&1));
-            assert_eq!(cache.get(&2), strings.get(&2));
+            assert_eq!(cache.get(&regular(1)), strings.get(&regular(1)));
+            assert_eq!(cache.get(&regular(2)), strings.get(&regular(2)));
         }
 
         // Generate same workspaces again - nothing should be altered
@@ -2372,7 +2441,7 @@ mod tests {
         assert!(altered_strings2.is_empty());
 
         app_workspaces.push(AppWorkspace {
-            id: 3,
+            id: regular(3),
             clients: vec![AppClient {
                 initial_class: "kitty".to_string(),
                 class: "kitty".to_string(),
@@ -2397,16 +2466,16 @@ mod tests {
 
         // Only the new workspace should be altered
         assert_eq!(altered_strings3.len(), 1);
-        assert_eq!(altered_strings3.get(&3), strings3.get(&3));
+        assert_eq!(altered_strings3.get(&regular(3)), strings3.get(&regular(3)));
 
-        let workspace_ids: HashSet<_> = app_workspaces.iter().map(|w| w.id).collect();
+        let workspace_ids: HashSet<_> = app_workspaces.iter().map(|w| w.id.clone()).collect();
         renamer
             .update_cache(&altered_strings3, &workspace_ids)
             .unwrap();
 
         // Generate different workspace set - should update cache
         let app_workspaces2 = vec![AppWorkspace {
-            id: 4,
+            id: regular(4),
             clients: vec![AppClient {
                 initial_class: "kitty".to_string(),
                 class: "kitty".to_string(),
@@ -2430,7 +2499,7 @@ mod tests {
         let altered_strings3 = renamer.get_altered_workspaces(&strings3).unwrap();
         assert_eq!(strings3, altered_strings3);
 
-        let workspace_ids: HashSet<_> = app_workspaces2.iter().map(|w| w.id).collect();
+        let workspace_ids: HashSet<_> = app_workspaces2.iter().map(|w| w.id.clone()).collect();
         renamer
             .update_cache(&altered_strings3, &workspace_ids)
             .unwrap();
@@ -2439,8 +2508,8 @@ mod tests {
         {
             let cache = renamer.workspace_strings_cache.lock().unwrap();
             assert_eq!(cache.len(), 1);
-            assert_eq!(cache.get(&1), strings3.get(&1));
-            assert_eq!(cache.get(&2), None);
+            assert_eq!(cache.get(&regular(4)), strings3.get(&regular(4)));
+            assert_eq!(cache.get(&regular(2)), None);
         }
 
         // Test cache reset
@@ -2490,13 +2559,13 @@ mod tests {
             },
         );
 
-        let mut expected = [(1, "test (13 of 20) dev-lang/rust".to_string())]
+        let mut expected = [(regular(1), "test (13 of 20) dev-lang/rust".to_string())]
             .into_iter()
             .collect();
 
         let mut actual = renamer.generate_workspaces_string(
             vec![AppWorkspace {
-                id: 1,
+                id: regular(1),
                 clients: vec![AppClient {
                     initial_class: "foot".to_string(),
                     class: "foot".to_string(),
@@ -2521,7 +2590,7 @@ mod tests {
         assert_eq!(actual, expected);
 
         expected = [(
-            1,
+            regular(1),
             "*#test(14 of 20) dev-lang/rust#between#1.69.0-r1 Compile:endtest#*".to_string(),
         )]
         .into_iter()
@@ -2529,7 +2598,7 @@ mod tests {
 
         actual = renamer.generate_workspaces_string(
             vec![AppWorkspace {
-                id: 1,
+                id: regular(1),
                 clients: vec![AppClient {
                     initial_class: "foot".to_string(),
                     class: "foot".to_string(),
@@ -2567,18 +2636,59 @@ mod tests {
             .push(("1".to_string(), "one".to_string()));
 
         let expected = "zero".to_string();
-        let actual = get_workspace_name(0, &config.workspaces_name);
+        let actual = get_workspace_name(
+            &WorkspaceType::Regular("0".to_string()),
+            &config.workspaces_name,
+        );
 
         assert_eq!(actual, expected);
 
         let expected = "one".to_string();
-        let actual = get_workspace_name(1, &config.workspaces_name);
+        let actual = get_workspace_name(&regular(1), &config.workspaces_name);
 
         assert_eq!(actual, expected);
 
         let expected = "3".to_string();
-        let actual = get_workspace_name(3, &config.workspaces_name);
+        let actual = get_workspace_name(&regular(3), &config.workspaces_name);
 
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn workspace_name_to_type_parses_special_and_regular() {
+        assert_eq!(
+            workspace_name_to_type("special:foo"),
+            WorkspaceType::Special(Some("foo".to_string()))
+        );
+        assert_eq!(
+            workspace_name_to_type("special"),
+            WorkspaceType::Special(None)
+        );
+        assert_eq!(
+            workspace_name_to_type("dev"),
+            WorkspaceType::Regular("dev".to_string())
+        );
+    }
+
+    #[test]
+    fn workspace_id_strings_formats_numeric_and_special() {
+        let (id, id_long) = workspace_id_strings(&WorkspaceType::Regular("7".to_string()));
+        assert_eq!(id, "7");
+        assert_eq!(id_long, "07");
+
+        let (id, id_long) = workspace_id_strings(&WorkspaceType::Regular("dev".to_string()));
+        assert_eq!(id, "dev");
+        assert_eq!(id_long, "dev");
+
+        let special_named = WorkspaceType::Special(Some("scratch".to_string()));
+        let (id, id_long) = workspace_id_strings(&special_named);
+        let identifier = special_named.to_string();
+        assert_eq!(id, identifier);
+        assert_eq!(id_long, identifier);
+
+        let special = WorkspaceType::Special(None);
+        let (id, id_long) = workspace_id_strings(&special);
+        assert_eq!(id, special.to_string());
+        assert_eq!(id_long, special.to_string());
     }
 }
