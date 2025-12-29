@@ -19,6 +19,8 @@ use std::error::Error;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+type WorkspaceClients = HashMap<i32, Vec<(AppClient, (i16, i16))>>;
+
 pub struct Renamer {
     known_workspaces: Mutex<HashSet<i32>>,
     cfg: Mutex<Config>,
@@ -151,7 +153,7 @@ impl Renamer {
         active_client: String,
         config: &ConfigFile,
     ) -> Result<Vec<AppWorkspace>, Box<dyn Error + '_>> {
-        let mut workspaces: HashMap<i32, Vec<(AppClient, (i16, i16))>> = self
+        let mut workspaces: WorkspaceClients = self
             .known_workspaces
             .lock()?
             .iter()
@@ -164,25 +166,22 @@ impl Renamer {
             let workspace_id = client.workspace.id;
             self.known_workspaces.lock()?.insert(workspace_id);
             let is_active = active_client == client.address.to_string();
-            workspaces
-                .entry(workspace_id)
-                .or_insert_with(Vec::new)
-                .push((
-                    AppClient::new(
-                        client.clone(),
+            workspaces.entry(workspace_id).or_default().push((
+                AppClient::new(
+                    client.clone(),
+                    is_active,
+                    is_dedup_inactive_fullscreen,
+                    self.parse_icon(
+                        client.initial_class,
+                        client.class,
+                        client.initial_title,
+                        client.title,
                         is_active,
-                        is_dedup_inactive_fullscreen,
-                        self.parse_icon(
-                            client.initial_class,
-                            client.class,
-                            client.initial_title,
-                            client.title,
-                            is_active,
-                            config,
-                        ),
+                        config,
                     ),
-                    client.at,
-                ));
+                ),
+                client.at,
+            ));
         }
 
         Ok(workspaces

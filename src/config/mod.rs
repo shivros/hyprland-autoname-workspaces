@@ -255,7 +255,8 @@ fn migrate_config_file(
 
 pub fn create_default_config(cfg_path: &PathBuf) -> Result<String, Box<dyn Error + 'static>> {
     // TODO: maybe we should dump the config from the default values of the struct?
-    let default_config = format!(r#"version = "{VERSION}"
+    let default_config = format!(
+        r#"version = "{VERSION}"
 
 # [format]
 # Deduplicate icons if enable.
@@ -349,7 +350,8 @@ aProgram = "^$" # will match null title for aProgram
 9 = "nine"
 10 = "ten"
 
-"#);
+"#
+    );
 
     let mut config_file = File::create(cfg_path)?;
     write!(&mut config_file, "{}", default_config.trim())?;
