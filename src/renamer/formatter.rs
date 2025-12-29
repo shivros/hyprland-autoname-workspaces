@@ -2,18 +2,24 @@ use crate::renamer::ConfigFile;
 use crate::renamer::IconStatus::*;
 use crate::{AppClient, Renamer};
 use hyprland::data::FullscreenMode;
+use hyprland::shared::{WorkspaceId, WorkspaceType};
 use std::collections::HashMap;
 use strfmt::strfmt;
 
 #[derive(Clone)]
 pub struct AppWorkspace {
-    pub id: i32,
+    pub id: WorkspaceType,
+    pub hyprland_id: WorkspaceId,
     pub clients: Vec<AppClient>,
 }
 
 impl AppWorkspace {
-    pub fn new(id: i32, clients: Vec<AppClient>) -> Self {
-        AppWorkspace { id, clients }
+    pub fn new(id: WorkspaceType, hyprland_id: WorkspaceId, clients: Vec<AppClient>) -> Self {
+        AppWorkspace {
+            id,
+            hyprland_id,
+            clients,
+        }
     }
 }
 
@@ -22,7 +28,7 @@ impl Renamer {
         &self,
         workspaces: Vec<AppWorkspace>,
         config: &ConfigFile,
-    ) -> HashMap<i32, String> {
+    ) -> HashMap<WorkspaceType, String> {
         let vars = HashMap::from([("delim".to_string(), config.format.delim.to_string())]);
         workspaces
             .iter()
@@ -70,7 +76,7 @@ impl Renamer {
                 let delimiter = formatter("{delim}", &vars);
                 let joined_string = workspace_output.join(&delimiter);
 
-                (workspace.id, joined_string)
+                (workspace.id.clone(), joined_string)
             })
             .collect()
     }
@@ -217,6 +223,7 @@ pub fn to_superscript(number: i32) -> String {
 mod tests {
     use super::*;
     use crate::renamer::IconConfig::*;
+    use hyprland::shared::WorkspaceType;
 
     #[test]
     fn test_app_workspace_new() {
@@ -231,9 +238,11 @@ mod tests {
             is_dedup_inactive_fullscreen: false,
         };
 
-        let workspace = AppWorkspace::new(1, vec![client]);
+        let workspace =
+            AppWorkspace::new(WorkspaceType::try_from(1).unwrap(), 1, vec![client]);
 
-        assert_eq!(workspace.id, 1);
+        assert_eq!(workspace.id, WorkspaceType::Regular("1".to_string()));
+        assert_eq!(workspace.hyprland_id, 1);
         assert_eq!(workspace.clients.len(), 1);
         assert_eq!(workspace.clients[0].class, "Class");
         assert_eq!(workspace.clients[0].title, "Title");

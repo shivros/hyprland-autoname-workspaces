@@ -11,7 +11,7 @@ use hyprland::data::{Client, Clients, FullscreenMode, Workspace};
 use hyprland::dispatch::*;
 use hyprland::event_listener::{EventListener, WorkspaceEventData};
 use hyprland::prelude::*;
-use hyprland::shared::Address;
+use hyprland::shared::{Address, WorkspaceId, WorkspaceType};
 use icon::{IconConfig, IconStatus};
 use inotify::{Inotify, WatchMask};
 use std::collections::{HashMap, HashSet};
@@ -20,10 +20,10 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 pub struct Renamer {
-    known_workspaces: Mutex<HashSet<i32>>,
+    known_workspaces: Mutex<HashMap<WorkspaceType, WorkspaceId>>,
     cfg: Mutex<Config>,
     args: Args,
-    workspace_strings_cache: Mutex<HashMap<i32, String>>,
+    workspace_strings_cache: Mutex<HashMap<WorkspaceType, String>>,
 }
 
 #[derive(Clone, Eq, Debug)]
@@ -73,7 +73,7 @@ impl AppClient {
 impl Renamer {
     pub fn new(cfg: Config, args: Args) -> Arc<Self> {
         Arc::new(Renamer {
-            known_workspaces: Mutex::new(HashSet::default()),
+            known_workspaces: Mutex::new(HashMap::default()),
             cfg: Mutex::new(cfg),
             args,
             workspace_strings_cache: Mutex::new(HashMap::new()),
@@ -95,7 +95,11 @@ impl Renamer {
 
         // Get workspaces based on open clients
         let workspaces = self.get_workspaces_from_clients(clients, active_client, config)?;
-        let workspace_ids: HashSet<_> = workspaces.iter().map(|w| w.id).collect();
+        let workspace_ids: HashMap<WorkspaceType, WorkspaceId> = workspaces
+            .iter()
+            .map(|w| (w.id.clone(), w.hyprland_id))
+            .collect();
+        let workspace_id_keys: HashSet<_> = workspace_ids.keys().cloned().collect();
 
         // Generate workspace strings
         let workspaces_strings = self.generate_workspaces_string(workspaces, config);
@@ -103,25 +107,27 @@ impl Renamer {
         // Filter out unchanged workspaces
         let altered_workspaces = self.get_altered_workspaces(&workspaces_strings)?;
 
-        altered_workspaces.iter().for_each(|(&id, clients)| {
-            rename_cmd(id, clients, &config.format, &config.workspaces_name);
+        altered_workspaces.iter().for_each(|(id, clients)| {
+            if let Some(raw_id) = workspace_ids.get(id) {
+                rename_cmd(*raw_id, id, clients, &config.format, &config.workspaces_name);
+            }
         });
 
-        self.update_cache(&altered_workspaces, &workspace_ids)?;
+        self.update_cache(&altered_workspaces, &workspace_id_keys)?;
 
         Ok(())
     }
 
     fn get_altered_workspaces(
         &self,
-        workspaces_strings: &HashMap<i32, String>,
-    ) -> Result<HashMap<i32, String>, Box<dyn Error + '_>> {
+        workspaces_strings: &HashMap<WorkspaceType, String>,
+    ) -> Result<HashMap<WorkspaceType, String>, Box<dyn Error + '_>> {
         let cache = self.workspace_strings_cache.lock()?;
         Ok(workspaces_strings
             .iter()
-            .filter_map(|(&id, new_string)| {
-                if cache.get(&id) != Some(new_string) {
-                    Some((id, new_string.clone()))
+            .filter_map(|(id, new_string)| {
+                if cache.get(id) != Some(new_string) {
+                    Some((id.clone(), new_string.clone()))
                 } else {
                     None
                 }
@@ -131,16 +137,16 @@ impl Renamer {
 
     fn update_cache(
         &self,
-        workspaces_strings: &HashMap<i32, String>,
-        workspace_ids: &HashSet<i32>,
+        workspaces_strings: &HashMap<WorkspaceType, String>,
+        workspace_ids: &HashSet<WorkspaceType>,
     ) -> Result<(), Box<dyn Error + '_>> {
         let mut cache = self.workspace_strings_cache.lock()?;
-        for (&id, new_string) in workspaces_strings {
-            cache.insert(id, new_string.clone());
+        for (id, new_string) in workspaces_strings {
+            cache.insert(id.clone(), new_string.clone());
         }
 
         // Remove cached entries for workspaces that no longer exist
-        cache.retain(|&id, _| workspace_ids.contains(&id));
+        cache.retain(|id, _| workspace_ids.contains(id));
 
         Ok(())
     }
@@ -151,48 +157,54 @@ impl Renamer {
         active_client: String,
         config: &ConfigFile,
     ) -> Result<Vec<AppWorkspace>, Box<dyn Error + '_>> {
-        let mut workspaces: HashMap<i32, Vec<(AppClient, (i16, i16))>> = self
-            .known_workspaces
-            .lock()?
-            .iter()
-            .map(|&i| (i, Vec::new()))
-            .collect();
+        let mut workspaces: HashMap<WorkspaceType, (WorkspaceId, Vec<(AppClient, (i16, i16))>)> =
+            self.known_workspaces
+                .lock()?
+                .iter()
+                .map(|(workspace, id)| (workspace.clone(), (*id, Vec::new())))
+                .collect();
 
         let is_dedup_inactive_fullscreen = config.format.dedup_inactive_fullscreen;
 
         for client in clients {
             let workspace_id = client.workspace.id;
-            self.known_workspaces.lock()?.insert(workspace_id);
+            let workspace_type =
+                workspace_type_from_parts(workspace_id, &client.workspace.name);
+
+            self.known_workspaces
+                .lock()?
+                .insert(workspace_type.clone(), workspace_id);
             let is_active = active_client == client.address.to_string();
-            workspaces
-                .entry(workspace_id)
-                .or_insert_with(Vec::new)
-                .push((
-                    AppClient::new(
-                        client.clone(),
+            let entry = workspaces
+                .entry(workspace_type)
+                .or_insert_with(|| (workspace_id, Vec::new()));
+            entry.0 = workspace_id;
+            entry.1.push((
+                AppClient::new(
+                    client.clone(),
+                    is_active,
+                    is_dedup_inactive_fullscreen,
+                    self.parse_icon(
+                        client.initial_class,
+                        client.class,
+                        client.initial_title,
+                        client.title,
                         is_active,
-                        is_dedup_inactive_fullscreen,
-                        self.parse_icon(
-                            client.initial_class,
-                            client.class,
-                            client.initial_title,
-                            client.title,
-                            is_active,
-                            config,
-                        ),
+                        config,
                     ),
-                    client.at,
-                ));
+                ),
+                client.at,
+            ));
         }
 
         Ok(workspaces
             .into_iter()
-            .map(|(id, mut clients)| {
+            .map(|(id, (hyprland_id, mut clients))| {
                 clients.sort_by(|a, b| a.1 .0.cmp(&b.1 .0).then_with(|| a.1 .1.cmp(&b.1 .1)));
 
                 let clients = clients.into_iter().map(|(client, _)| client).collect();
 
-                AppWorkspace::new(id, clients)
+                AppWorkspace::new(id, hyprland_id, clients)
             })
             .collect())
     }
@@ -200,10 +212,16 @@ impl Renamer {
     pub fn reset_workspaces(&self, config: ConfigFile) -> Result<(), Box<dyn Error + '_>> {
         self.workspace_strings_cache.lock()?.clear();
 
-        self.known_workspaces
+        let known_workspaces: Vec<(WorkspaceType, WorkspaceId)> = self
+            .known_workspaces
             .lock()?
             .iter()
-            .for_each(|&id| rename_cmd(id, "", &config.format, &config.workspaces_name));
+            .map(|(workspace, id)| (workspace.clone(), *id))
+            .collect();
+
+        known_workspaces.iter().for_each(|(workspace, id)| {
+            rename_cmd(*id, workspace, "", &config.format, &config.workspaces_name)
+        });
 
         Ok(())
     }
@@ -267,31 +285,42 @@ impl Renamer {
     }
 
     fn remove_workspace(&self, wt: WorkspaceEventData) -> Result<bool, Box<dyn Error + '_>> {
-        Ok(self.known_workspaces.lock()?.remove(&wt.id))
+        let workspace =
+            workspace_type_from_parts(wt.id, &workspace_type_to_string(&wt.name));
+        Ok(self.known_workspaces.lock()?.remove(&workspace).is_some())
     }
 }
 
 fn rename_empty_workspace(config: &ConfigFile) {
     _ = Workspace::get_active().map(|workspace| {
         if workspace.windows == 0 {
-            rename_cmd(workspace.id, "", &config.format, &config.workspaces_name);
+            let workspace_type = workspace_type_from_parts(workspace.id, &workspace.name);
+            rename_cmd(
+                workspace.id,
+                &workspace_type,
+                "",
+                &config.format,
+                &config.workspaces_name,
+            );
         }
     });
 }
 
 fn rename_cmd(
-    id: i32,
+    id: WorkspaceId,
+    workspace: &WorkspaceType,
     clients: &str,
     config_format: &ConfigFormatRaw,
     workspaces_name: &[(String, String)],
 ) {
     let workspace_fmt = &config_format.workspace.to_string();
     let workspace_empty_fmt = &config_format.workspace_empty.to_string();
+    let workspace_identifier = workspace_type_to_string(workspace);
     let id_two_digits = format!("{:02}", id);
-    let workspace_name = get_workspace_name(id, workspaces_name);
+    let workspace_name = get_workspace_name(workspace, workspaces_name);
 
     let mut vars = HashMap::from([
-        ("id".to_string(), id.to_string()),
+        ("id".to_string(), workspace_identifier),
         ("id_long".to_string(), id_two_digits),
         ("name".to_string(), workspace_name),
         ("delim".to_string(), config_format.delim.to_string()),
@@ -307,12 +336,13 @@ fn rename_cmd(
     let _ = hyprland::dispatch!(RenameWorkspace, id, Some(workspace.trim()));
 }
 
-fn get_workspace_name(id: i32, workspaces_name: &[(String, String)]) -> String {
-    let default_workspace_name = id.to_string();
+fn get_workspace_name(workspace: &WorkspaceType, workspaces_name: &[(String, String)]) -> String {
+    let workspace_key = workspace_type_to_string(workspace);
+    let default_workspace_name = workspace_key.clone();
     workspaces_name
         .iter()
         .find_map(|(x, name)| {
-            if x.eq(&id.to_string()) {
+            if x.eq(&workspace_key) {
                 Some(name)
             } else {
                 None
@@ -320,6 +350,35 @@ fn get_workspace_name(id: i32, workspaces_name: &[(String, String)]) -> String {
         })
         .unwrap_or(&default_workspace_name)
         .to_string()
+}
+
+fn workspace_type_to_string(workspace: &WorkspaceType) -> String {
+    match workspace {
+        WorkspaceType::Regular(name) => name.to_string(),
+        WorkspaceType::Special(Some(name)) => format!("special:{name}"),
+        WorkspaceType::Special(None) => "special".to_string(),
+    }
+}
+
+fn parse_workspace_type(name: &str) -> Option<WorkspaceType> {
+    if name == "special" {
+        Some(WorkspaceType::Special(None))
+    } else if let Some(stripped) = name.strip_prefix("special:") {
+        if stripped.is_empty() {
+            Some(WorkspaceType::Special(None))
+        } else {
+            Some(WorkspaceType::Special(Some(stripped.to_string())))
+        }
+    } else if name.is_empty() {
+        None
+    } else {
+        Some(WorkspaceType::Regular(name.to_string()))
+    }
+}
+
+fn workspace_type_from_parts(id: WorkspaceId, name: &str) -> WorkspaceType {
+    WorkspaceType::try_from(id)
+        .unwrap_or_else(|_| parse_workspace_type(name).unwrap_or(WorkspaceType::Regular(id.to_string())))
 }
 
 fn get_filtered_clients(config: &ConfigFile) -> Vec<Client> {
@@ -352,6 +411,15 @@ mod tests {
     use super::*;
     use crate::renamer::IconConfig::*;
     use crate::renamer::IconStatus::*;
+    use hyprland::shared::WorkspaceType;
+
+    fn workspace_type(id: i32) -> WorkspaceType {
+        WorkspaceType::try_from(id).unwrap()
+    }
+
+    fn workspace(id: i32, clients: Vec<AppClient>) -> AppWorkspace {
+        AppWorkspace::new(workspace_type(id), id, clients)
+    }
 
     #[test]
     fn test_app_client_partial_eq() {
@@ -452,12 +520,14 @@ mod tests {
             },
         );
 
-        let expected = [(1, "term5".to_string())].into_iter().collect();
+        let expected = [(workspace_type(1), "term5".to_string())]
+            .into_iter()
+            .collect();
 
         let actual = renamer.generate_workspaces_string(
-            vec![AppWorkspace {
-                id: 1,
-                clients: vec![
+            vec![workspace(
+                1,
+                vec![
                     AppClient {
                         initial_class: "kitty".to_string(),
                         class: "kitty".to_string(),
@@ -544,7 +614,7 @@ mod tests {
                         is_dedup_inactive_fullscreen: false,
                     },
                 ],
-            }],
+            )],
             &config,
         );
 
@@ -588,12 +658,14 @@ mod tests {
             },
         );
 
-        let expected = [(1, "Zsh #Zsh# *Zsh*".to_string())].into_iter().collect();
+        let expected = [(workspace_type(1), "Zsh #Zsh# *Zsh*".to_string())]
+            .into_iter()
+            .collect();
 
         let actual = renamer.generate_workspaces_string(
-            vec![AppWorkspace {
-                id: 1,
-                clients: vec![
+            vec![workspace(
+                1,
+                vec![
                     AppClient {
                         initial_class: "alacritty".to_string(),
                         class: "alacritty".to_string(),
@@ -646,7 +718,7 @@ mod tests {
                         is_dedup_inactive_fullscreen: false,
                     },
                 ],
-            }],
+            )],
             &config,
         );
         assert_eq!(actual, expected);
@@ -680,12 +752,14 @@ mod tests {
             },
         );
 
-        let expected = [(1, "term2 term3".to_string())].into_iter().collect();
+        let expected = [(workspace_type(1), "term2 term3".to_string())]
+            .into_iter()
+            .collect();
 
         let actual = renamer.generate_workspaces_string(
-            vec![AppWorkspace {
-                id: 1,
-                clients: vec![
+            vec![workspace(
+                1,
+                vec![
                     AppClient {
                         class: "kitty".to_string(),
                         title: "kitty".to_string(),
@@ -772,7 +846,7 @@ mod tests {
                         is_dedup_inactive_fullscreen: false,
                     },
                 ],
-            }],
+            )],
             &config,
         );
 
@@ -808,14 +882,14 @@ mod tests {
             },
         );
 
-        let expected = [(1, "term term term term term".to_string())]
+        let expected = [(workspace_type(1), "term term term term term".to_string())]
             .into_iter()
             .collect();
 
         let actual = renamer.generate_workspaces_string(
-            vec![AppWorkspace {
-                id: 1,
-                clients: vec![
+            vec![workspace(
+                1,
+                vec![
                     AppClient {
                         initial_class: "kitty".to_string(),
                         class: "kitty".to_string(),
@@ -902,7 +976,7 @@ mod tests {
                         is_dedup_inactive_fullscreen: false,
                     },
                 ],
-            }],
+            )],
             &config,
         );
 
@@ -931,14 +1005,14 @@ mod tests {
             },
         );
 
-        let expected = [(1, "term term *term* term term".to_string())]
+        let expected = [(workspace_type(1), "term term *term* term term".to_string())]
             .into_iter()
             .collect();
 
         let actual = renamer.generate_workspaces_string(
-            vec![AppWorkspace {
-                id: 1,
-                clients: vec![
+            vec![workspace(
+                1,
+                vec![
                     AppClient {
                         initial_class: "kitty".to_string(),
                         class: "kitty".to_string(),
@@ -1025,7 +1099,7 @@ mod tests {
                         is_dedup_inactive_fullscreen: false,
                     },
                 ],
-            }],
+            )],
             &config,
         );
 
@@ -1055,14 +1129,14 @@ mod tests {
             },
         );
 
-        let expected = [(1, "term term [term] term term".to_string())]
+        let expected = [(workspace_type(1), "term term [term] term term".to_string())]
             .into_iter()
             .collect();
 
         let actual = renamer.generate_workspaces_string(
-            vec![AppWorkspace {
-                id: 1,
-                clients: vec![
+            vec![workspace(
+                1,
+                vec![
                     AppClient {
                         initial_class: "kitty".to_string(),
                         class: "kitty".to_string(),
@@ -1149,7 +1223,7 @@ mod tests {
                         is_dedup_inactive_fullscreen: false,
                     },
                 ],
-            }],
+            )],
             &config,
         );
 
@@ -1179,14 +1253,14 @@ mod tests {
             },
         );
 
-        let expected = [(1, "term term [*term*] term term".to_string())]
+        let expected = [(workspace_type(1), "term term [*term*] term term".to_string())]
             .into_iter()
             .collect();
 
         let actual = renamer.generate_workspaces_string(
-            vec![AppWorkspace {
-                id: 1,
-                clients: vec![
+            vec![workspace(
+                1,
+                vec![
                     AppClient {
                         class: "kitty".to_string(),
                         initial_class: "kitty".to_string(),
@@ -1273,7 +1347,7 @@ mod tests {
                         is_dedup_inactive_fullscreen: false,
                     },
                 ],
-            }],
+            )],
             &config,
         );
 
@@ -1303,12 +1377,12 @@ mod tests {
             },
         );
 
-        let expected = [(1, "term5".to_string())].into_iter().collect();
+        let expected = [(workspace_type(1), "term5".to_string())].into_iter().collect();
 
         let actual = renamer.generate_workspaces_string(
-            vec![AppWorkspace {
-                id: 1,
-                clients: vec![
+            vec![workspace(
+                1,
+                vec![
                     AppClient {
                         initial_class: "kitty".to_string(),
                         class: "kitty".to_string(),
@@ -1360,7 +1434,7 @@ mod tests {
                         is_dedup_inactive_fullscreen: false,
                     },
                 ],
-            }],
+            )],
             &config,
         );
 
@@ -1393,12 +1467,12 @@ mod tests {
             },
         );
 
-        let expected = [(1, "term4 *term*".to_string())].into_iter().collect();
+        let expected = [(workspace_type(1), "term4 *term*".to_string())].into_iter().collect();
 
         let actual = renamer.generate_workspaces_string(
-            vec![AppWorkspace {
-                id: 1,
-                clients: vec![
+            vec![workspace(
+                1,
+                vec![
                     AppClient {
                         class: "kitty".to_string(),
                         initial_class: "kitty".to_string(),
@@ -1485,7 +1559,7 @@ mod tests {
                         is_dedup_inactive_fullscreen: false,
                     },
                 ],
-            }],
+            )],
             &config,
         );
 
@@ -1518,12 +1592,12 @@ mod tests {
             },
         );
 
-        let expected = [(1, "term4 [term]".to_string())].into_iter().collect();
+        let expected = [(workspace_type(1), "term4 [term]".to_string())].into_iter().collect();
 
         let actual = renamer.generate_workspaces_string(
-            vec![AppWorkspace {
-                id: 1,
-                clients: vec![
+            vec![workspace(
+                1,
+                vec![
                     AppClient {
                         class: "kitty".to_string(),
                         initial_class: "kitty".to_string(),
@@ -1610,7 +1684,7 @@ mod tests {
                         is_dedup_inactive_fullscreen: false,
                     },
                 ],
-            }],
+            )],
             &config,
         );
 
@@ -1646,12 +1720,12 @@ mod tests {
             },
         );
 
-        let expected = [(1, "term4 [*term*]".to_string())].into_iter().collect();
+        let expected = [(workspace_type(1), "term4 [*term*]".to_string())].into_iter().collect();
 
         let actual = renamer.generate_workspaces_string(
-            vec![AppWorkspace {
-                id: 1,
-                clients: vec![
+            vec![workspace(
+                1,
+                vec![
                     AppClient {
                         class: "kitty".to_string(),
                         initial_class: "kitty".to_string(),
@@ -1738,7 +1812,7 @@ mod tests {
                         is_dedup_inactive_fullscreen: false,
                     },
                 ],
-            }],
+            )],
             &config,
         );
 
@@ -1781,12 +1855,12 @@ mod tests {
             },
         );
 
-        let expected = [(1, "KKK *a* DDD".to_string())].into_iter().collect();
+        let expected = [(workspace_type(1), "KKK *a* DDD".to_string())].into_iter().collect();
 
         let actual = renamer.generate_workspaces_string(
-            vec![AppWorkspace {
-                id: 1,
-                clients: vec![
+            vec![workspace(
+                1,
+                vec![
                     AppClient {
                         initial_class: "kitty".to_string(),
                         class: "kitty".to_string(),
@@ -1839,7 +1913,7 @@ mod tests {
                         is_dedup_inactive_fullscreen: false,
                     },
                 ],
-            }],
+            )],
             &config,
         );
 
@@ -1868,12 +1942,12 @@ mod tests {
             },
         );
 
-        let expected = [(1, "spotify".to_string())].into_iter().collect();
+        let expected = [(workspace_type(1), "spotify".to_string())].into_iter().collect();
 
         let actual = renamer.generate_workspaces_string(
-            vec![AppWorkspace {
-                id: 1,
-                clients: vec![AppClient {
+            vec![workspace(
+                1,
+                vec![AppClient {
                     initial_class: "".to_string(),
                     class: "".to_string(),
                     title: "spotify".to_string(),
@@ -1890,7 +1964,7 @@ mod tests {
                     ),
                     is_dedup_inactive_fullscreen: false,
                 }],
-            }],
+            )],
             &config,
         );
 
@@ -1919,12 +1993,12 @@ mod tests {
             },
         );
 
-        let expected = [(1, "osu".to_string())].into_iter().collect();
+        let expected = [(workspace_type(1), "osu".to_string())].into_iter().collect();
 
         let actual = renamer.generate_workspaces_string(
-            vec![AppWorkspace {
-                id: 1,
-                clients: vec![AppClient {
+            vec![workspace(
+                1,
+                vec![AppClient {
                     initial_class: "osu!".to_string(),
                     class: "osu!".to_string(),
                     title: "osu!".to_string(),
@@ -1941,7 +2015,7 @@ mod tests {
                     ),
                     is_dedup_inactive_fullscreen: false,
                 }],
-            }],
+            )],
             &config,
         );
 
@@ -1979,14 +2053,14 @@ mod tests {
             },
         );
 
-        let expected = [(1, "*default inactive* default inactive".to_string())]
+        let expected = [(workspace_type(1), "*default inactive* default inactive".to_string())]
             .into_iter()
             .collect();
 
         let actual = renamer.generate_workspaces_string(
-            vec![AppWorkspace {
-                id: 1,
-                clients: vec![
+            vec![workspace(
+                1,
+                vec![
                     AppClient {
                         initial_class: "fake-app-unknown".to_string(),
                         class: "fake-app-unknown".to_string(),
@@ -2022,7 +2096,7 @@ mod tests {
                         is_dedup_inactive_fullscreen: false,
                     },
                 ],
-            }],
+            )],
             &config,
         );
 
@@ -2052,12 +2126,12 @@ mod tests {
             },
         );
 
-        let expected = [(1, "default active".to_string())].into_iter().collect();
+        let expected = [(workspace_type(1), "default active".to_string())].into_iter().collect();
 
         let actual = renamer.generate_workspaces_string(
-            vec![AppWorkspace {
-                id: 1,
-                clients: vec![AppClient {
+            vec![workspace(
+                1,
+                vec![AppClient {
                     initial_class: "kitty".to_string(),
                     class: "kitty".to_string(),
                     title: "~".to_string(),
@@ -2074,7 +2148,7 @@ mod tests {
                     ),
                     is_dedup_inactive_fullscreen: false,
                 }],
-            }],
+            )],
             &config,
         );
 
@@ -2098,9 +2172,9 @@ mod tests {
         );
 
         let actual = renamer.generate_workspaces_string(
-            vec![AppWorkspace {
-                id: 1,
-                clients: vec![AppClient {
+            vec![workspace(
+                1,
+                vec![AppClient {
                     initial_class: "kitty".to_string(),
                     class: "kitty".to_string(),
                     initial_title: "zsh".to_string(),
@@ -2117,13 +2191,13 @@ mod tests {
                     ),
                     is_dedup_inactive_fullscreen: false,
                 }],
-            }],
+            )],
             &config,
         );
 
         // When no active default is configured, the inactive default is used
         // and run through the same formatter as a normal inactive client.
-        let expected = [(1, "*\u{f059} kitty*".to_string())].into_iter().collect();
+        let expected = [(workspace_type(1), "*\u{f059} kitty*".to_string())].into_iter().collect();
 
         assert_eq!(actual, expected);
     }
@@ -2160,12 +2234,12 @@ mod tests {
             },
         );
 
-        let expected = [(1, "term2".to_string())].into_iter().collect();
+        let expected = [(workspace_type(1), "term2".to_string())].into_iter().collect();
 
         let actual = renamer.generate_workspaces_string(
-            vec![AppWorkspace {
-                id: 1,
-                clients: vec![AppClient {
+            vec![workspace(
+                1,
+                vec![AppClient {
                     initial_class: "kitty".to_string(),
                     class: "kitty".to_string(),
                     title: "~".to_string(),
@@ -2182,7 +2256,7 @@ mod tests {
                         &config,
                     ),
                 }],
-            }],
+            )],
             &config,
         );
 
@@ -2208,9 +2282,9 @@ mod tests {
         );
 
         let actual = renamer.generate_workspaces_string(
-            vec![AppWorkspace {
-                id: 1,
-                clients: vec![AppClient {
+            vec![workspace(
+                1,
+                vec![AppClient {
                     initial_class: "kitty".to_string(),
                     class: "kitty".to_string(),
                     initial_title: "zsh".to_string(),
@@ -2227,11 +2301,11 @@ mod tests {
                     ),
                     is_dedup_inactive_fullscreen: false,
                 }],
-            }],
+            )],
             &config,
         );
 
-        let expected = [(1, "term3".to_string())].into_iter().collect();
+        let expected = [(workspace_type(1), "term3".to_string())].into_iter().collect();
 
         assert_eq!(actual, expected);
 
@@ -2255,9 +2329,9 @@ mod tests {
         );
 
         let actual = renamer.generate_workspaces_string(
-            vec![AppWorkspace {
-                id: 1,
-                clients: vec![AppClient {
+            vec![workspace(
+                1,
+                vec![AppClient {
                     initial_class: "kitty".to_string(),
                     class: "kitty".to_string(),
                     initial_title: "zsh".to_string(),
@@ -2274,11 +2348,11 @@ mod tests {
                     ),
                     is_dedup_inactive_fullscreen: false,
                 }],
-            }],
+            )],
             &config,
         );
 
-        let expected = [(1, "term4".to_string())].into_iter().collect();
+        let expected = [(workspace_type(1), "term4".to_string())].into_iter().collect();
 
         assert_eq!(actual, expected);
     }
@@ -2308,9 +2382,9 @@ mod tests {
         assert_eq!(renamer.workspace_strings_cache.lock().unwrap().len(), 0);
 
         let mut app_workspaces = vec![
-            AppWorkspace {
-                id: 1,
-                clients: vec![AppClient {
+            workspace(
+                1,
+                vec![AppClient {
                     initial_class: "kitty".to_string(),
                     class: "kitty".to_string(),
                     title: "term1".to_string(),
@@ -2327,10 +2401,10 @@ mod tests {
                     ),
                     is_dedup_inactive_fullscreen: false,
                 }],
-            },
-            AppWorkspace {
-                id: 2,
-                clients: vec![AppClient {
+            ),
+            workspace(
+                2,
+                vec![AppClient {
                     initial_class: "kitty".to_string(),
                     class: "kitty".to_string(),
                     title: "term2".to_string(),
@@ -2347,7 +2421,7 @@ mod tests {
                     ),
                     is_dedup_inactive_fullscreen: false,
                 }],
-            },
+            ),
         ];
 
         let strings = renamer.generate_workspaces_string(app_workspaces.clone(), &config);
@@ -2355,7 +2429,7 @@ mod tests {
         let altered_strings = renamer.get_altered_workspaces(&strings).unwrap();
         assert_eq!(strings, altered_strings);
 
-        let workspace_ids: HashSet<_> = app_workspaces.iter().map(|w| w.id).collect();
+        let workspace_ids: HashSet<_> = app_workspaces.iter().map(|w| w.id.clone()).collect();
         renamer
             .update_cache(&altered_strings, &workspace_ids)
             .unwrap();
@@ -2371,9 +2445,9 @@ mod tests {
         let altered_strings2 = renamer.get_altered_workspaces(&strings).unwrap();
         assert!(altered_strings2.is_empty());
 
-        app_workspaces.push(AppWorkspace {
-            id: 3,
-            clients: vec![AppClient {
+        app_workspaces.push(workspace(
+            3,
+            vec![AppClient {
                 initial_class: "kitty".to_string(),
                 class: "kitty".to_string(),
                 title: "term3".to_string(),
@@ -2390,24 +2464,27 @@ mod tests {
                 ),
                 is_dedup_inactive_fullscreen: false,
             }],
-        });
+        ));
 
         let strings3 = renamer.generate_workspaces_string(app_workspaces.clone(), &config);
         let altered_strings3 = renamer.get_altered_workspaces(&strings3).unwrap();
 
         // Only the new workspace should be altered
         assert_eq!(altered_strings3.len(), 1);
-        assert_eq!(altered_strings3.get(&3), strings3.get(&3));
+        assert_eq!(
+            altered_strings3.get(&workspace_type(3)),
+            strings3.get(&workspace_type(3))
+        );
 
-        let workspace_ids: HashSet<_> = app_workspaces.iter().map(|w| w.id).collect();
+        let workspace_ids: HashSet<_> = app_workspaces.iter().map(|w| w.id.clone()).collect();
         renamer
             .update_cache(&altered_strings3, &workspace_ids)
             .unwrap();
 
         // Generate different workspace set - should update cache
-        let app_workspaces2 = vec![AppWorkspace {
-            id: 4,
-            clients: vec![AppClient {
+        let app_workspaces2 = vec![workspace(
+            4,
+            vec![AppClient {
                 initial_class: "kitty".to_string(),
                 class: "kitty".to_string(),
                 title: "term3".to_string(), // Different title
@@ -2424,13 +2501,13 @@ mod tests {
                 ),
                 is_dedup_inactive_fullscreen: false,
             }],
-        }];
+        )];
 
         let strings3 = renamer.generate_workspaces_string(app_workspaces2.clone(), &config);
         let altered_strings3 = renamer.get_altered_workspaces(&strings3).unwrap();
         assert_eq!(strings3, altered_strings3);
 
-        let workspace_ids: HashSet<_> = app_workspaces2.iter().map(|w| w.id).collect();
+        let workspace_ids: HashSet<_> = app_workspaces2.iter().map(|w| w.id.clone()).collect();
         renamer
             .update_cache(&altered_strings3, &workspace_ids)
             .unwrap();
@@ -2439,8 +2516,11 @@ mod tests {
         {
             let cache = renamer.workspace_strings_cache.lock().unwrap();
             assert_eq!(cache.len(), 1);
-            assert_eq!(cache.get(&1), strings3.get(&1));
-            assert_eq!(cache.get(&2), None);
+            assert_eq!(
+                cache.get(&workspace_type(1)),
+                strings3.get(&workspace_type(1))
+            );
+            assert_eq!(cache.get(&workspace_type(2)), None);
         }
 
         // Test cache reset
@@ -2490,7 +2570,7 @@ mod tests {
             },
         );
 
-        let mut expected = [(1, "test (13 of 20) dev-lang/rust".to_string())]
+        let mut expected = [(workspace_type(1), "test (13 of 20) dev-lang/rust".to_string())]
             .into_iter()
             .collect();
 
